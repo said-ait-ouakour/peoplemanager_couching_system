@@ -175,6 +175,8 @@ def resolve_concept_from_env(concept_id: str) -> ResolvedConcept:
         supabase_user_table=raw["supabase_user_table"],
         supabase_email_col=raw["supabase_email_col"],
         supabase_phone_col=raw["supabase_phone_col"],
+        supabase_user_role_col=raw["supabase_user_role_col"],
+        supabase_user_role_value=raw["supabase_user_role_value"],
         supabase_peoplemanager_id_col=raw["supabase_peoplemanager_id_col"],
         calls_user_id_col=raw["calls_user_id_col"],
         calls_date_col=raw["calls_date_col"],
@@ -366,6 +368,7 @@ class ConceptWorkflow:
             self.supabase.table(c.supabase_user_table)
             .select(cols)
             .eq(c.supabase_email_col, email)
+            .eq(c.supabase_user_role_col, c.supabase_user_role_value)
             .limit(1)
             .execute()
         )
@@ -387,6 +390,7 @@ class ConceptWorkflow:
             self.supabase.table(c.supabase_user_table)
             .select(cols)
             .eq(c.supabase_peoplemanager_id_col, mongo_user_id_str)
+            .eq(c.supabase_user_role_col, c.supabase_user_role_value)
             .limit(1)
             .execute()
         )

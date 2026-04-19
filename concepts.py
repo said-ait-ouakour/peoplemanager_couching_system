@@ -20,6 +20,12 @@ _SHARED_MONGO = {
     "coaching_order_col": "date",
 }
 
+# Supabase `users`: only rows with this role are treated as advisors when resolving phone/id.
+_SHARED_SUPABASE_USER_ROLE = {
+    "supabase_user_role_col": "role",
+    "supabase_user_role_value": "advisor",
+}
+
 # Supabase meetings (per concept project): count rows for meetings_yesterday.
 _SHARED_MEETINGS = {
     "supabase_advisor_id_col": "id",
@@ -34,6 +40,7 @@ _SHARED_MEETINGS = {
 CONCEPTS: Dict[str, Dict[str, Any]] = {
     "people_manager": {
         **_SHARED_MONGO,
+        **_SHARED_SUPABASE_USER_ROLE,
         **_SHARED_MEETINGS,
         "mongo_users_collection": "users",
         "advisor_query": {"role": "advisor"},
@@ -50,6 +57,7 @@ CONCEPTS: Dict[str, Dict[str, Any]] = {
     },
     "t_and_b": {
         **_SHARED_MONGO,
+        **_SHARED_SUPABASE_USER_ROLE,
         **_SHARED_MEETINGS,
         "mongo_users_collection": "users",
         "advisor_query": {"role": "advisor"},
@@ -80,6 +88,8 @@ class ResolvedConcept:
     supabase_user_table: str
     supabase_email_col: str
     supabase_phone_col: str
+    supabase_user_role_col: str
+    supabase_user_role_value: str
     supabase_peoplemanager_id_col: str
     calls_user_id_col: str
     calls_date_col: str

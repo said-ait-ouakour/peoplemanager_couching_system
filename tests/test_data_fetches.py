@@ -51,7 +51,12 @@ def test_map_advisors_loads_phone_via_mongo_id_on_supabase_peoplemanager_id(samp
     fake = FakeSupabaseClient(
         {
             "users": [
-                {"peoplemanager_id": mongo_id, "phone": "+1 415 555 2671", "id": "pm-supabase-advisor-1"},
+                {
+                    "peoplemanager_id": mongo_id,
+                    "phone": "+1 415 555 2671",
+                    "id": "pm-supabase-advisor-1",
+                    "role": "advisor",
+                },
             ]
         }
     )

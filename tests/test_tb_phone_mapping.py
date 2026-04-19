@@ -62,6 +62,7 @@ def test_tb_maps_mongo_advisor_email_to_phone_via_tb_supabase(tb_concept) -> Non
                     "email": "advisor.tb@example.com",
                     "phone": "+44 20 7946 0958",
                     "id": "tb-supabase-advisor-1",
+                    "role": "advisor",
                 }
             ]
         }
