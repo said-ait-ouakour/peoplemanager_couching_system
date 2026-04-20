@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from unittest.mock import patch
 
 import mongomock
 
-from dates_london import yesterday_london_iso, yesterday_london_utc_bounds
+from dates_london import previous_working_day, yesterday_london_iso, yesterday_london_utc_bounds
 from nac_feedback import extract_nac_feedback_texts
 from tests.fake_supabase import FakeSupabaseClient
 from workflow_engine import (
@@ -126,6 +126,12 @@ def test_yesterday_london_iso_shape() -> None:
     assert re.fullmatch(r"\d{4}-\d{2}-\d{2}", d)
 
 
+def test_previous_working_day_weekend_rules() -> None:
+    assert previous_working_day(date(2026, 4, 20)).isoformat() == "2026-04-17"  # Monday -> Friday
+    assert previous_working_day(date(2026, 4, 19)).isoformat() == "2026-04-17"  # Sunday -> Friday
+    assert previous_working_day(date(2026, 4, 22)).isoformat() == "2026-04-21"  # Wednesday -> Tuesday
+
+
 @patch("workflow_engine.MongoClient", lambda *_a, **_k: mongomock.MongoClient())
 def test_build_daily_payload_vapi_contract(sample_concept) -> None:
     wf = ConceptWorkflow(sample_concept, SharedServiceConfig())
@@ -144,9 +150,10 @@ def test_build_daily_payload_vapi_contract(sample_concept) -> None:
     }
     coaching = {"userId": "u1", "previous_call_summary": "Last call recap."}
 
-    payload = wf.build_daily_payload(advisor, 1, 1, nac, coaching)
+    payload = wf.build_daily_payload(advisor, "2026-04-17", 1, 1, nac, coaching)
 
     assert payload["Advisor Name"] == "Jane Advisor"
+    assert payload["repport_date"] == "Friday 17-04-2026"
     assert payload["Performance Tier"] == "INTERMEDIATE"
     assert payload["Calls yesterday"] == 1
     assert payload["Meetings yesterday"] == 1
@@ -155,6 +162,7 @@ def test_build_daily_payload_vapi_contract(sample_concept) -> None:
     assert payload["Memory"] == "Last call recap."
     assert set(payload.keys()) == {
         "Advisor Name",
+        "repport_date",
         "Performance Tier",
         "Calls yesterday",
         "Meetings yesterday",
@@ -193,3 +201,9 @@ def test_compute_performance_tier_rules() -> None:
     assert _compute_performance_tier(5, 0) == "HIGH"
     assert _compute_performance_tier(4, 2) == "HIGH"
     assert _compute_performance_tier(1, 2) == "HIGH"
+
+
+@patch("workflow_engine.MongoClient", lambda *_a, **_k: mongomock.MongoClient())
+def test_to_e164_uk_local_zero_prefix(sample_concept) -> None:
+    wf = ConceptWorkflow(sample_concept, SharedServiceConfig())
+    assert wf.to_e164("02033362694") == "+442033362694"

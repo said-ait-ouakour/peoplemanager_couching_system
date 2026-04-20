@@ -6,13 +6,16 @@ import logging
 import os
 import uuid
 import threading
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
+from datetime import date
 
 import phonenumbers
 import requests
 from bson import ObjectId
+from dotenv import load_dotenv
 from pymongo import MongoClient
 from supabase import Client, create_client
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
@@ -21,6 +24,9 @@ from concepts import ResolvedConcept, get_concept_definition
 from dates_london import yesterday_london_iso, yesterday_london_utc_bounds
 
 logger = logging.getLogger("advisor-orchestration")
+
+# Load project .env for direct module/CLI usage (does not override already-exported env vars).
+load_dotenv(Path(__file__).resolve().parent / ".env", override=False)
 
 
 def yesterday_utc_date() -> str:
@@ -64,7 +70,7 @@ def _shared_mongo_uri_and_db() -> Tuple[str, str]:
 
 
 def default_run_date() -> str:
-    """London yesterday, unless OVERRIDE_RUN_DATE=YYYY-MM-DD (manual/debug)."""
+    """London previous working day, unless OVERRIDE_RUN_DATE=YYYY-MM-DD (manual/debug)."""
     override = (os.environ.get("OVERRIDE_RUN_DATE") or "").strip()
     if override:
         return override
@@ -224,7 +230,8 @@ class SharedServiceConfig:
         _phone_id = os.environ.get("VAPI_PHONE_NUMBER_ID", "").strip()
         self.vapi_phone_number_id = _phone_id or None
         self.default_region = os.environ.get("PHONE_DEFAULT_REGION", "US")
-        self.audit_table = os.environ.get("ADVISOR_OUTREACH_AUDIT_TABLE", "").strip() or None
+        # Audit is intentionally disabled for now.
+        self.audit_table = None
         self.vapi_max_concurrent = max(1, int(os.environ.get("VAPI_MAX_CONCURRENT_PER_CONCEPT", "3")))
 
 
@@ -268,20 +275,41 @@ class ConceptWorkflow:
     def _audit_enabled(self) -> bool:
         return self.shared.audit_table is not None
 
+    def _handle_audit_error(self, exc: Exception) -> bool:
+        """
+        Disable audit and continue when the configured audit table does not exist.
+        Returns True when caller should fail-open (skip audit op), else False.
+        """
+        msg = str(exc)
+        if "PGRST205" in msg or "Could not find the table" in msg:
+            logger.warning(
+                "Audit disabled: table '%s' is unavailable (%s). Continuing without audit.",
+                self.shared.audit_table,
+                msg,
+            )
+            self.shared.audit_table = None
+            return True
+        return False
+
     def _already_succeeded(self, run_date: str, email: str) -> bool:
         if not self._audit_enabled():
             return False
         assert self.shared.audit_table is not None
-        r = (
-            self.supabase.table(self.shared.audit_table)
-            .select("id")
-            .eq("concept", self.concept.concept_id)
-            .eq("advisor_email", email)
-            .eq("run_date", run_date)
-            .eq("status", "success")
-            .limit(1)
-            .execute()
-        )
+        try:
+            r = (
+                self.supabase.table(self.shared.audit_table)
+                .select("id")
+                .eq("concept", self.concept.concept_id)
+                .eq("advisor_email", email)
+                .eq("run_date", run_date)
+                .eq("status", "success")
+                .limit(1)
+                .execute()
+            )
+        except Exception as exc:  # noqa: BLE001
+            if self._handle_audit_error(exc):
+                return False
+            raise
         return bool(r.data)
 
     def _audit_insert(
@@ -305,7 +333,12 @@ class ConceptWorkflow:
             "reason": reason,
             "vapi_call_id": vapi_call_id,
         }
-        self.supabase.table(self.shared.audit_table).insert(row).execute()
+        try:
+            self.supabase.table(self.shared.audit_table).insert(row).execute()
+        except Exception as exc:  # noqa: BLE001
+            if self._handle_audit_error(exc):
+                return
+            raise
 
     def _audit_update(
         self,
@@ -328,7 +361,12 @@ class ConceptWorkflow:
             .eq("advisor_email", email)
             .eq("run_date", run_date)
         )
-        q.execute()
+        try:
+            q.execute()
+        except Exception as exc:  # noqa: BLE001
+            if self._handle_audit_error(exc):
+                return
+            raise
 
     def get_advisors_from_mongo(self, mongo_user_ids: Optional[List[str]] = None) -> List[Dict[str, Any]]:
         """Advisors matching concept `advisor_query`; optional filter by Mongo `users._id` (hex or str)."""
@@ -363,49 +401,37 @@ class ConceptWorkflow:
         wait=wait_exponential(multiplier=1, min=1, max=30),
         retry=retry_if_exception_type(Exception),
     )
-    def fetch_supabase_user_row_by_email(self, email: str) -> Optional[Dict[str, Any]]:
+    def fetch_supabase_user_row(self, *, email: str, mongo_user_id_str: str) -> Optional[Dict[str, Any]]:
+        """
+        Fetch one advisor row from Supabase `users` using concept lookup mode.
+
+        Query is always an AND operation:
+          - role column must match configured advisor role
+          - lookup key matches either email (TB) or peoplemanager_id (PM)
+        """
         c = self.concept
         cols = f"{c.supabase_email_col},{c.supabase_phone_col},{c.supabase_advisor_id_col}"
-        response = (
-            self.supabase.table(c.supabase_user_table)
-            .select(cols)
-            .eq(c.supabase_email_col, email)
-            .eq(c.supabase_user_role_col, c.supabase_user_role_value)
-            .limit(1)
-            .execute()
+        q = self.supabase.table(c.supabase_user_table).select(cols).eq(
+            c.supabase_user_role_col, c.supabase_user_role_value
         )
-        if not response.data:
-            return None
-        return dict(response.data[0])
-
-    @retry(
-        reraise=True,
-        stop=stop_after_attempt(5),
-        wait=wait_exponential(multiplier=1, min=1, max=30),
-        retry=retry_if_exception_type(Exception),
-    )
-    def fetch_supabase_user_row_by_peoplemanager_id(self, mongo_user_id_str: str) -> Optional[Dict[str, Any]]:
-        """PM: Supabase users.peoplemanager_id column stores str(Mongo users._id)."""
-        c = self.concept
-        cols = f"{c.supabase_phone_col},{c.supabase_advisor_id_col}"
-        response = (
-            self.supabase.table(c.supabase_user_table)
-            .select(cols)
-            .eq(c.supabase_peoplemanager_id_col, mongo_user_id_str)
-            .eq(c.supabase_user_role_col, c.supabase_user_role_value)
-            .limit(1)
-            .execute()
-        )
+        mode = (c.supabase_lookup_mode or "").strip().lower()
+        if mode == "email":
+            q = q.eq(c.supabase_email_col, email)
+        elif mode == "peoplemanager_id":
+            q = q.eq(c.supabase_peoplemanager_id_col, mongo_user_id_str)
+        else:
+            raise RuntimeError(f"Unknown supabase_lookup_mode: {c.supabase_lookup_mode}")
+        response = q.limit(1).execute()
         if not response.data:
             return None
         return dict(response.data[0])
 
     def fetch_phone_from_supabase_by_email(self, email: str) -> Optional[str]:
-        row = self.fetch_supabase_user_row_by_email(email)
+        row = self.fetch_supabase_user_row(email=email, mongo_user_id_str="")
         return row.get(self.concept.supabase_phone_col) if row else None
 
     def fetch_phone_from_supabase_by_peoplemanager_id(self, mongo_user_id_str: str) -> Optional[str]:
-        row = self.fetch_supabase_user_row_by_peoplemanager_id(mongo_user_id_str)
+        row = self.fetch_supabase_user_row(email="", mongo_user_id_str=mongo_user_id_str)
         return row.get(self.concept.supabase_phone_col) if row else None
 
     def map_advisors_to_supabase_phone(
@@ -422,20 +448,19 @@ class ConceptWorkflow:
                 logger.warning("Skipping advisor %s: missing Mongo _id", email or "?")
                 continue
 
-            if mode == "email":
-                if not email:
-                    continue
-                row = self.fetch_supabase_user_row_by_email(email)
-            elif mode == "peoplemanager_id":
-                row = self.fetch_supabase_user_row_by_peoplemanager_id(mongo_id_str)
-            else:
-                raise RuntimeError(f"Unknown supabase_lookup_mode: {mode}")
+            if mode == "email" and not email:
+                continue
+            row = self.fetch_supabase_user_row(email=email, mongo_user_id_str=mongo_id_str)
 
             if not row:
                 continue
             phone = row.get(c.supabase_phone_col)
             advisor_id_raw = row.get(c.supabase_advisor_id_col)
             if not phone:
+                logger.info(
+                    "Skipping advisor %s: no phone in Supabase users row",
+                    email or mongo_id_str,
+                )
                 continue
             if advisor_id_raw is None or str(advisor_id_raw).strip() == "":
                 logger.warning(
@@ -462,16 +487,33 @@ class ConceptWorkflow:
                     mongo_document=mongo_doc,
                 )
             )
+            logger.info(
+                "Advisor mapped [%s] name=%s email=%s mongo_user_id=%s supabase_advisor_id=%s e164_phone=%s",
+                c.concept_id,
+                name,
+                email,
+                mongo_id_str,
+                str(advisor_id_raw).strip(),
+                e164_phone,
+            )
         return valid
 
     def to_e164(self, raw_phone: str) -> Optional[str]:
-        try:
-            parsed = phonenumbers.parse(raw_phone, self.shared.default_region)
-            if not phonenumbers.is_valid_number(parsed):
-                return None
-            return phonenumbers.format_number(parsed, phonenumbers.PhoneNumberFormat.E164)
-        except phonenumbers.NumberParseException:
+        compact = str(raw_phone or "").strip()
+        compact = "".join(compact.split())
+        if not compact:
             return None
+        if compact.startswith("+"):
+            return compact
+
+        digits = "".join(ch for ch in compact if ch.isdigit())
+        if not digits:
+            return None
+
+        if digits.startswith("0") and len(digits) >= 10:
+            return f"+44{digits[1:]}"
+
+        return f"+{digits}"
 
     def _serialize_mongo_doc(self, doc: Dict[str, Any]) -> Dict[str, Any]:
         out = dict(doc)
@@ -485,10 +527,17 @@ class ConceptWorkflow:
             return {"$in": [uid, ObjectId(uid)]}
         return uid
 
-    def _calls_date_range_yesterday(self) -> Dict[str, Any]:
-        """London calendar yesterday as UTC half-open interval [lo, hi) on BSON/datetime `date` field."""
-        lo, hi = yesterday_london_utc_bounds()
+    def _calls_date_range_yesterday(self, run_date: str) -> Dict[str, Any]:
+        """Run date as UTC half-open interval [lo, hi) on BSON/datetime `date` field."""
+        lo, hi = yesterday_london_utc_bounds(run_date)
         return {"$gte": lo, "$lt": hi}
+
+    def _run_date_weekday_name(self, run_date: str) -> str:
+        return date.fromisoformat(run_date).strftime("%A")
+
+    def _run_date_display(self, run_date: str) -> str:
+        d = date.fromisoformat(run_date)
+        return f"{d.strftime('%A')} {d.strftime('%d-%m-%Y')}"
 
     def _advisor_supabase_user_id(self, advisor: AdvisorRecord) -> Optional[str]:
         """Mongo userId on related collections = str(Mongo users._id)."""
@@ -497,12 +546,19 @@ class ConceptWorkflow:
     def fetch_yesterday_customer_calls_from_mongo(
         self, user_id: str, run_date: str
     ) -> List[Dict[str, Any]]:
-        """All call rows for userId with `calls_date_col` in [start, end) of yesterday in Europe/London."""
+        """All call rows for userId with `calls_date_col` in [start, end) of run date in Europe/London."""
         c = self.concept
         coll = self.mongo_db[c.mongo_calls_collection]
+        date_range = self._calls_date_range_yesterday(run_date)
+        configured_date_col = c.calls_date_col
+        candidate_date_cols = [configured_date_col]
+        # Real datasets may use "Date" while config/tests use "date".
+        if configured_date_col.lower() == "date":
+            candidate_date_cols.extend(["Date", "date"])
+        candidate_date_cols = list(dict.fromkeys(candidate_date_cols))
         q: Dict[str, Any] = {
             c.calls_user_id_col: self._user_id_match(user_id),
-            c.calls_date_col: self._calls_date_range_yesterday(),
+            "$or": [{col: date_range} for col in candidate_date_cols],
         }
         docs = list(coll.find(q))
         return [self._serialize_mongo_doc(d) for d in docs]
@@ -561,7 +617,7 @@ class ConceptWorkflow:
         retry=retry_if_exception_type(Exception),
     )
     def fetch_meetings_yesterday_count_from_supabase(self, advisor_supabase_id: str, run_date: str) -> int:
-        """Meetings linked to Supabase advisor id with meeting_date in London yesterday (range or calendar day)."""
+        """Meetings linked to Supabase advisor id with meeting_date in London run_date (range or calendar day)."""
         c = self.concept
         mode = (c.meetings_date_match_mode or "utc_bounds").strip().lower()
         if mode == "iso_day":
@@ -572,7 +628,7 @@ class ConceptWorkflow:
                 .eq(c.supabase_meetings_date_col, run_date)
             )
         else:
-            lo, hi = yesterday_london_utc_bounds()
+            lo, hi = yesterday_london_utc_bounds(run_date)
             q = (
                 self.supabase.table(c.supabase_meetings_table)
                 .select("*", count="exact")
@@ -590,6 +646,7 @@ class ConceptWorkflow:
     def build_daily_payload(
         self,
         advisor: AdvisorRecord,
+        run_date: str,
         calls_yesterday: int,
         meetings_yesterday: int,
         last_nac_feedback_row: Optional[Dict[str, Any]],
@@ -605,6 +662,7 @@ class ConceptWorkflow:
         meetings_n = meetings_yesterday
         tier = _compute_performance_tier(calls_n, meetings_n)
         return {
+            "repport_date": self._run_date_display(run_date),
             "Advisor Name": advisor.advisor_name,
             "Performance Tier": tier,
             "Calls yesterday": calls_n,
@@ -623,13 +681,15 @@ class ConceptWorkflow:
     def call_vapi_advisor(
         self, advisor: AdvisorRecord, daily_payload: Dict[str, Any]
     ) -> Tuple[int, str, Optional[str]]:
-        endpoint = f"{self.shared.vapi_base_url}/call/phone"
+        endpoint = f"{self.shared.vapi_base_url}/call"
         phone_number_id = self.concept.vapi_phone_number_id or self.shared.vapi_phone_number_id
         body: Dict[str, Any] = {
             "assistantId": self.concept.vapi_assistant_id,
+            "phoneNumberId": phone_number_id,
             "customer": {"number": advisor.e164_phone},
             "assistantOverrides": {
                 "variableValues": {
+                    "advisor_name": advisor.advisor_name,
                     "daily_payload": daily_payload,
                 },
             },
@@ -681,6 +741,16 @@ class ConceptWorkflow:
             meetings_count = self.fetch_meetings_yesterday_count_from_supabase(
                 advisor.supabase_advisor_id, run_date
             )
+            logger.info(
+                "Advisor activity [%s] name=%s email=%s phone=%s calls=%s meetings=%s run_date=%s",
+                self.concept.concept_id,
+                advisor.advisor_name,
+                advisor.email,
+                advisor.e164_phone,
+                calls_count,
+                meetings_count,
+                run_date,
+            )
 
             if calls_count == 0 and meetings_count == 0:
                 logger.info(
@@ -704,13 +774,30 @@ class ConceptWorkflow:
 
             daily_payload = self.build_daily_payload(
                 advisor,
+                run_date,
                 calls_count,
                 meetings_count,
                 nac_row,
                 coaching,
             )
+            logger.info(
+                "Daily payload prepared [%s] name=%s email=%s payload=%s",
+                self.concept.concept_id,
+                advisor.advisor_name,
+                advisor.email,
+                daily_payload,
+            )
             _status, _text, vapi_id = self.call_vapi_advisor(advisor, daily_payload)
-            logger.info("VAPI call queued for advisor: %s", advisor.email)
+            logger.info(
+                "VAPI call queued [%s] name=%s email=%s phone=%s calls=%s meetings=%s vapi_call_id=%s",
+                self.concept.concept_id,
+                advisor.advisor_name,
+                advisor.email,
+                advisor.e164_phone,
+                calls_count,
+                meetings_count,
+                vapi_id or "",
+            )
             if self._audit_enabled():
                 self._audit_update(
                     batch_run_id,

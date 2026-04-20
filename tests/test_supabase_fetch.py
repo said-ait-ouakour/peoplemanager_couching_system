@@ -34,7 +34,7 @@ requires_integration = pytest.mark.skipif(
     reason="Set RUN_DATA_INTEGRATION_TESTS=1 and PM/TB Supabase + VAPI/OpenAI env vars.",
 )
 
-_FETCH_LIMIT = 5
+_FETCH_LIMIT = 102
 _MEETINGS_SAMPLE_LIMIT = 25
 
 
@@ -59,56 +59,78 @@ def _meetings_rows_for_supabase_user_id(
 
 @requires_integration
 @pytest.mark.integration
-def test_live_fetch_first_five_users_pm_and_tb_supabase() -> None:
-    """Hit real PM and TB Supabase; assert each returns at least one row (service role can read `users`)."""
+def test_live_mongo_advisors_exist_in_pm_supabase_users() -> None:
+    """Fetch advisors from Mongo `users` and verify existence in PM Supabase `users` via peoplemanager_id."""
     shared = SharedServiceConfig()
     wf_pm: ConceptWorkflow | None = None
-    wf_tb: ConceptWorkflow | None = None
     try:
         wf_pm = ConceptWorkflow(resolve_concept_from_env("people_manager"), shared)
-        wf_tb = ConceptWorkflow(resolve_concept_from_env("t_and_b"), shared)
-
         table_pm = wf_pm.concept.supabase_user_table
-        table_tb = wf_tb.concept.supabase_user_table
+        pm_id_col = wf_pm.concept.supabase_peoplemanager_id_col
+        pm_role_col = wf_pm.concept.supabase_user_role_col
+        pm_role_val = wf_pm.concept.supabase_user_role_value
 
-        res_pm = wf_pm.supabase.table(table_pm).select("*").eq("peoplemanager_id","68ecf6f32c8477ba341295fd").limit(_FETCH_LIMIT).execute()
-        res_tb = wf_tb.supabase.table(table_tb).select("*").limit(_FETCH_LIMIT).execute()
+        mongo_advisors = wf_pm.get_advisors_from_mongo()[:_FETCH_LIMIT]
+        assert mongo_advisors, "No Mongo advisors returned for people_manager advisor query."
 
-        rows_pm: List[Dict[str, Any]] = list(res_pm.data or [])
-        rows_tb: List[Dict[str, Any]] = list(res_tb.data or [])
+        mongo_ids: List[str] = []
+        for adv in mongo_advisors:
+            mongo_id = str(adv.get("_id") or "").strip()
+            if mongo_id:
+                mongo_ids.append(mongo_id)
+
+        assert mongo_ids, "No valid Mongo advisor ids found."
+
+        # Explicit AND filter: role = advisor AND peoplemanager_id in Mongo advisor ids.
+        pm_rows_res = (
+            wf_pm.supabase.table(table_pm)
+            .select(pm_id_col)
+            .eq(pm_role_col, pm_role_val)
+            .in_(pm_id_col, mongo_ids)
+            .execute()
+        )
+        pm_rows = list(pm_rows_res.data or [])
+        found_ids = sorted(
+            {
+                str(row.get(pm_id_col)).strip()
+                for row in pm_rows
+                if row.get(pm_id_col) is not None and str(row.get(pm_id_col)).strip()
+            }
+        )
+        found_set = set(found_ids)
+        missing_ids = [mid for mid in mongo_ids if mid not in found_set]
+        checks: List[Dict[str, Any]] = [
+            {"mongo_user_id": mid, "exists_in_pm_users": mid in found_set}
+            for mid in mongo_ids
+        ]
 
         result: Dict[str, Any] = {
             "fetch_limit": _FETCH_LIMIT,
+            "mongo_advisors_checked": len(checks),
             "pm_supabase": {
                 "table": table_pm,
                 "project_env": "PM_SUPABASE_URL",
-                "row_count": len(rows_pm),
-                "rows": rows_pm,
+                "matching_column": pm_id_col,
+                "role_filter": {pm_role_col: pm_role_val},
             },
-            "tb_supabase": {
-                "table": table_tb,
-                "project_env": "TB_SUPABASE_URL",
-                "row_count": len(rows_tb),
-                "rows": rows_tb,
-            },
+            "found_count": len(found_ids),
+            "found_mongo_user_ids": found_ids,
+            "missing_count": len(missing_ids),
+            "missing_mongo_user_ids": missing_ids,
+            "checks": checks,
         }
 
-        print("\n=== Live Supabase fetch (PM + TB `users`, limit %s) ===\n" % _FETCH_LIMIT)
+        print("\n=== Mongo advisors existence in PM Supabase users ===\n")
         print(json.dumps(result, indent=2, default=str))
 
-        assert isinstance(rows_pm, list)
-        assert isinstance(rows_tb, list)
-        assert len(rows_pm) >= 1, (
-            "PM Supabase returned no rows — check users table, RLS, and PM_SUPABASE_SERVICE_ROLE_KEY."
-        )
-        assert len(rows_tb) >= 1, (
-            "TB Supabase returned no rows — check users table, RLS, and TB_SUPABASE_SERVICE_ROLE_KEY."
+        assert checks, "No valid Mongo advisor ids found to check against PM Supabase."
+        assert found_ids, (
+            f"No Mongo advisors were found in PM Supabase users by {pm_id_col}. "
+            "Check PM project/env mapping and peoplemanager_id sync."
         )
     finally:
         if wf_pm is not None:
             wf_pm.close()
-        if wf_tb is not None:
-            wf_tb.close()
 
 
 @requires_integration

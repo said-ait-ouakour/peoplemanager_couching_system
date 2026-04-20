@@ -15,6 +15,9 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+from pathlib import Path
+
+from dotenv import load_dotenv
 
 from concepts import list_concept_ids
 from workflow_engine import default_run_date, process_concept
@@ -31,7 +34,14 @@ def _bridge_legacy_env_to_people_manager() -> None:
         os.environ["VAPI_PM_ASSISTANT_ID"] = os.environ["VAPI_ASSISTANT_ID"]
 
 
+def _load_env_file() -> None:
+    """Load project .env for direct CLI runs."""
+    root = Path(__file__).resolve().parent
+    load_dotenv(root / ".env", override=False)
+
+
 def main() -> None:
+    _load_env_file()
     parser = argparse.ArgumentParser(description="Advisor outreach — Mongo advisors → Supabase → VAPI")
     parser.add_argument(
         "--concept",
