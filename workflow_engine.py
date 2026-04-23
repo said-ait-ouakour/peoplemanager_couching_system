@@ -1155,21 +1155,26 @@ class ConceptWorkflow:
         prompt = (
             "Classify call outcome into one label: real_conversation, voicemail, no_response.\n"
             "Return strict JSON with keys label and reason.\n"
+            "Definitions:\n"
+            "- real_conversation means the call reached a successful coaching outcome: the advisor actually engaged\n"
+            "  with the assistant AND they confirmed or enhanced concrete actions the advisor will apply on future calls\n"
+            "  (e.g. agreement on next steps, commitment to change phrasing/flow, explicit takeaway for the next dial).\n"
+            "  Generic small talk, partial intro, or discussing numbers without that closing confirmation does NOT qualify.\n"
+            "- If the call never reaches that confirmation/enhancement stage, use no_response (not real_conversation).\n"
             "Decision rules:\n"
-            "1) real_conversation ONLY if the called person has a substantive back-and-forth with the assistant\n"
-            "   about their previous day calls/meetings/performance/coaching context.\n"
-            "2) If transcript has only greeting, hold/transfer/system message, short acknowledgement,\n"
-            "   or call ends before discussing prior-day performance, classify as no_response.\n"
-            "3) Classify as voicemail when any voicemail/auto-attendant cues are present, such as:\n"
-            "   'forwarded to voicemail', 'no one is available', 'at the tone', 'record your message',\n"
-            "   'mailbox', 'press #', 'please leave a message', or similar system prompts.\n"
-            "4) If assistant keeps talking after a voicemail prompt, that is still voicemail,\n"
-            "   not real_conversation.\n"
+            "1) real_conversation ONLY when both: (a) substantive two-way dialogue about coaching/performance is present,\n"
+            "   and (b) there is clear confirmation or actionable enhancement for what to do on the next call(s).\n"
+            "2) Hold/transfer lines ('please hold', 'trying to connect you'), wrong-number style replies\n"
+            "   (e.g. unrelated answers like 'date of birth'), or nonsense/off-topic user lines after hold -> no_response.\n"
+            "3) Only greeting, hold, early hangup, or assistant monologue before any confirmed coaching outcome -> no_response.\n"
+            "4) Voicemail/auto-attendant cues ('forwarded to voicemail', 'at the tone', 'record your message',\n"
+            "   'no one is available', mailbox, leave a message) -> voicemail. Assistant leaving a message after that cue\n"
+            "   is still voicemail, not real_conversation.\n"
             "5) When uncertain between real_conversation and no_response, choose no_response.\n"
             "Examples:\n"
-            "- AI asks identity, user says hello/please hold, AI starts intro, then hangup -> no_response.\n"
-            "- Call is forwarded to voicemail and assistant leaves message about performance -> voicemail.\n"
-            "- Advisor and AI discuss yesterday calls/meetings/coaching points -> real_conversation.\n"
+            "- Hold then user says unrelated thing; no agreed next-step for calls -> no_response.\n"
+            "- Voicemail greeting then assistant speaks about performance -> voicemail.\n"
+            "- Advisor and assistant agree on specific changes for next outreach and confirm understanding -> real_conversation.\n"
             f"ended_reason: {ended_reason}\n"
             f"transcript: {transcript_text[:8000]}"
         )
@@ -1177,7 +1182,14 @@ class ConceptWorkflow:
             model=self.shared.openai_model,
             temperature=0,
             messages=[
-                {"role": "system", "content": "You are a strict classifier."},
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a strict classifier. Label real_conversation only when the transcript shows both "
+                        "meaningful coaching dialogue and explicit confirmation or enhancement for the advisor's "
+                        "next calls. Otherwise use no_response or voicemail."
+                    ),
+                },
                 {"role": "user", "content": prompt},
             ],
             response_format={"type": "json_object"},
