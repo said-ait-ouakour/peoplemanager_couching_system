@@ -26,6 +26,17 @@ from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_ex
 
 from concepts import ResolvedConcept, get_concept_definition
 from dates_london import london_today_date, yesterday_london_iso, yesterday_london_utc_bounds
+from hubstaff import (
+    fetch_hubstaff_for_advisor,
+    hubstaff_configured,
+    summary_to_payload_dict,
+)
+from training_progress import (
+    build_training_progress_summary,
+    fetch_training_progress_documents,
+    load_training_reference_maps,
+    training_progress_enabled,
+)
 
 logger = logging.getLogger("advisor-orchestration")
 LONDON = ZoneInfo("Europe/London")
@@ -420,6 +431,8 @@ class AdvisorRecord:
     e164_phone: str
     # Canonical linkage id = str(Mongo users document _id); matches Supabase userId & users.peoplemanager_id (PM).
     peoplemanager_id: Optional[str]
+    # Supabase users.hubstaff_id for Hubstaff v2 API (PM and T&B).
+    hubstaff_id: Optional[int]
     # Supabase users row primary key (or configured column); joins meetings.advisor_id.
     supabase_advisor_id: str
     # Full Mongo users document (all fields) after serialization (_id as str).
@@ -449,6 +462,9 @@ class ConceptWorkflow:
         self.mongo_db = self.mongo[concept.mongo_db_name]
         self._active_run_date: Optional[str] = None
         self._logs_root = Path(__file__).resolve().parent / "logs"
+        # Prefetched in run(): workspace id -> name, training step id -> name (read-only during advisor workers).
+        self._training_workspace_names: Dict[str, str] = {}
+        self._training_step_names: Dict[str, str] = {}
         # Thread-local HTTP/Supabase: Session is not shared safely across threads.
         self._tls = threading.local()
 
@@ -542,7 +558,7 @@ class ConceptWorkflow:
           - lookup key matches either email (TB) or peoplemanager_id (PM)
         """
         c = self.concept
-        cols = f"{c.supabase_email_col},{c.supabase_phone_col},{c.supabase_advisor_id_col}"
+        cols = f"{c.supabase_email_col},{c.supabase_phone_col},{c.supabase_advisor_id_col},hubstaff_id"
         q = self.supabase.table(c.supabase_user_table).select(cols).eq(
             c.supabase_user_role_col, c.supabase_user_role_value
         )
@@ -631,6 +647,14 @@ class ConceptWorkflow:
                 )
                 continue
 
+            hs_raw = row.get("hubstaff_id")
+            hubstaff_user_id: Optional[int] = None
+            if hs_raw is not None and str(hs_raw).strip() != "":
+                try:
+                    hubstaff_user_id = int(hs_raw)
+                except (TypeError, ValueError):
+                    hubstaff_user_id = None
+
             mongo_doc = dict(advisor)
             valid.append(
                 AdvisorRecord(
@@ -639,6 +663,7 @@ class ConceptWorkflow:
                     email=email,
                     e164_phone=e164_phone,
                     peoplemanager_id=mongo_id_str,
+                    hubstaff_id=hubstaff_user_id,
                     supabase_advisor_id=str(advisor_id_raw).strip(),
                     mongo_document=mongo_doc,
                 )
@@ -712,6 +737,48 @@ class ConceptWorkflow:
     def _run_date_display(self, run_date: str) -> str:
         d = date.fromisoformat(run_date)
         return f"{d.strftime('%A')} {d.strftime('%d-%m-%Y')}"
+
+    def prefetch_training_reference_maps(self) -> None:
+        """Load workspace + step name maps from Mongo (same as ``run()`` before processing advisors)."""
+        self._training_workspace_names = {}
+        self._training_step_names = {}
+        if training_progress_enabled():
+            try:
+                self._training_workspace_names, self._training_step_names = load_training_reference_maps(
+                    self.mongo_db
+                )
+                self._write_concept_log(
+                    "training",
+                    f"reference_maps workspaces={len(self._training_workspace_names)} "
+                    f"steps={len(self._training_step_names)}",
+                )
+            except Exception as exc:
+                logger.warning("[%s] training reference prefetch failed: %s", self.concept.concept_id, exc)
+                self._training_workspace_names, self._training_step_names = {}, {}
+
+    def _compute_trainings_payload(self, mongo_user_id: str) -> Tuple[Dict[str, Any], int]:
+        """Returns ``(daily_payload['trainings'], len(trainingprogresses docs))``."""
+        if not training_progress_enabled():
+            return {}, 0
+        try:
+            prog_docs = fetch_training_progress_documents(self.mongo_db, mongo_user_id)
+            payload = build_training_progress_summary(
+                prog_docs,
+                self._training_workspace_names,
+                self._training_step_names,
+            )
+            return payload, len(prog_docs)
+        except Exception as exc:
+            logger.warning("[training] failed user=%s: %s", mongo_user_id, exc)
+            return {}, 0
+
+    def trainings_payload_for_mongo_user_id(self, mongo_user_id: str) -> Dict[str, Any]:
+        """
+        Exact dict placed at ``daily_payload['trainings']`` when training is enabled and maps are prefetched
+        (call ``prefetch_training_reference_maps()`` first — ``run()`` does this automatically).
+        """
+        payload, _ = self._compute_trainings_payload(mongo_user_id)
+        return payload
 
     def _advisor_supabase_user_id(self, advisor: AdvisorRecord) -> Optional[str]:
         """Mongo userId on related collections = str(Mongo users._id)."""
@@ -825,6 +892,8 @@ class ConceptWorkflow:
         meetings_yesterday: int,
         last_nac_feedback_row: Optional[Dict[str, Any]],
         last_coaching_row: Optional[Dict[str, Any]],
+        hubstaff: Optional[Dict[str, Any]] = None,
+        training: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Structured fields for VAPI assistantOverrides.variableValues.daily_payload (display labels)."""
         c = self.concept
@@ -835,7 +904,7 @@ class ConceptWorkflow:
         calls_n = calls_yesterday
         meetings_n = meetings_yesterday
         tier = _compute_performance_tier(calls_n, meetings_n)
-        return {
+        out: Dict[str, Any] = {
             "repport_date": self._run_date_display(run_date),
             "Advisor Name": advisor.advisor_name,
             "Performance Tier": tier,
@@ -845,6 +914,11 @@ class ConceptWorkflow:
             "Coaching Context": _coaching_context_label(c.concept_id),
             "Memory": memory,
         }
+        if hubstaff is not None:
+            out["Hubstaff"] = hubstaff
+        if training is not None:
+            out["trainings"] = training
+        return out
 
     @retry(
         reraise=True,
@@ -1363,6 +1437,43 @@ class ConceptWorkflow:
                 )
                 return "skipped"
 
+            hubstaff_payload: Optional[Dict[str, Any]] = None
+            if hubstaff_configured():
+                if advisor.hubstaff_id:
+                    try:
+                        summary = fetch_hubstaff_for_advisor(run_date, advisor.hubstaff_id)
+                        hubstaff_payload = dict(summary_to_payload_dict(summary))
+                        logger.info(
+                            "[hubstaff] concept=%s advisor=%s idle_over_30=%s low_activity=%s late_9am=%s first=%s",
+                            self.concept.concept_id,
+                            advisor.email,
+                            summary.idle_over_30,
+                            summary.low_activity,
+                            summary.late_start_after_9am_london,
+                            summary.first_activity_time,
+                        )
+                        self._write_concept_log(
+                            "hubstaff",
+                            f"advisor={advisor.advisor_name} email={advisor.email} hubstaff_id={advisor.hubstaff_id} "
+                            f"idle_over_30={summary.idle_over_30} low_activity={summary.low_activity} "
+                            f"late_9am_london={summary.late_start_after_9am_london}",
+                        )
+                    except Exception as exc:
+                        logger.warning("[hubstaff] fetch failed advisor=%s: %s", advisor.email, exc)
+                        hubstaff_payload = {}
+                else:
+                    hubstaff_payload = {}
+            else:
+                hubstaff_payload = {}
+
+            training_payload, prog_n = self._compute_trainings_payload(uid)
+            if training_progress_enabled():
+                self._write_concept_log(
+                    "training",
+                    f"advisor={advisor.advisor_name} email={advisor.email} mongo_user_id={uid} "
+                    f"progress_rows={prog_n} workspaces_in_payload={len(training_payload)}",
+                )
+
             nac_row = self.fetch_latest_nac_from_mongo(uid)
             coaching = self.fetch_latest_coaching_from_mongo(uid)
 
@@ -1373,6 +1484,8 @@ class ConceptWorkflow:
                 meetings_count,
                 nac_row,
                 coaching,
+                hubstaff_payload,
+                training_payload,
             )
             logger.info(
                 "Daily payload prepared [%s] name=%s email=%s payload=%s",
@@ -1424,6 +1537,8 @@ class ConceptWorkflow:
         mapped = self.map_advisors_to_supabase_phone(advisors)
         logger.info("[%s] Advisors with valid phone numbers: %d", self.concept.concept_id, len(mapped))
         self._write_concept_log("mapping", f"mapped_with_valid_phone={len(mapped)}")
+
+        self.prefetch_training_reference_maps()
 
         max_workers = self.shared.vapi_max_concurrent
         lock = threading.Lock()
