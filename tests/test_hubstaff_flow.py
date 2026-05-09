@@ -80,6 +80,8 @@ def test_hubstaff_live_flow_token_to_activities_to_summary() -> None:
         "late_start_after_9am_london",
         "idle_start_time",
         "idle_end_time",
+        "activity_percentage",
+        "tracked_hours",
     }
 
     if _should_print():

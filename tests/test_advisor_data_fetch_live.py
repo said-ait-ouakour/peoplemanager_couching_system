@@ -14,9 +14,10 @@ Optional:
   DATA_FETCH_TEST_PRINT=1 — print fetched summary to stdout (default 1). Set 0 to silence.
   DATA_FETCH_TEST_PRINT_FULL_CALLS=1 — include full call documents in print (can be large).
   DATA_FETCH_TEST_PRINT_FULL_NAC_COACHING=1 — include full latest NAC / coaching Mongo documents.
-  DATA_FETCH_TEST_DAILY_PAYLOAD_ACTIVITY=any — when to build/print daily_payload (same gate as production):
+  DATA_FETCH_TEST_DAILY_PAYLOAD_ACTIVITY=any — when to build/print daily_payload sample (optional filter for logs):
     any (default): yesterday calls > 0 OR meetings > 0
     both: calls > 0 AND meetings > 0
+    always: always print payload notes (production dials all mapped advisors regardless)
 
 Run pytest with -s (or --capture=no) so prints appear in the terminal.
 
@@ -33,8 +34,18 @@ import pytest
 
 from concepts import list_concept_ids
 from dates_london import yesterday_london_iso
-from hubstaff import fetch_hubstaff_for_advisor, hubstaff_configured, summary_to_payload_dict
-from workflow_engine import ConceptWorkflow, SharedServiceConfig, resolve_concept_from_env
+from hubstaff import (
+    build_objective_of_the_day,
+    fetch_hubstaff_for_advisor,
+    hubstaff_configured,
+    summary_to_payload_dict,
+)
+from workflow_engine import (
+    ConceptWorkflow,
+    SharedServiceConfig,
+    _compute_performance_tier,
+    resolve_concept_from_env,
+)
 
 
 pytestmark = pytest.mark.integration
@@ -77,8 +88,10 @@ def _truncate(s: Any, limit: int = 240) -> str:
 
 
 def _has_yesterday_activity(calls_count: int, meetings_n: int) -> bool:
-    """Match process_single_advisor gate: skip VAPI only when both are zero."""
+    """Filter for when this test prints daily_payload notes (production always dials mapped advisors)."""
     mode = (os.environ.get("DATA_FETCH_TEST_DAILY_PAYLOAD_ACTIVITY") or "any").strip().lower()
+    if mode in ("always", "all_users"):
+        return True
     if mode in ("both", "and", "all"):
         return calls_count > 0 and meetings_n > 0
     return calls_count > 0 or meetings_n > 0
@@ -244,11 +257,12 @@ def test_advisors_mapped_supabase_then_calls_and_meetings(workflow: ConceptWorkf
         calls_count = len(yesterday_calls)
 
         hubstaff_payload: Dict[str, Any]
+        hs_summary_obj = None
         if hubstaff_configured():
             if advisor.hubstaff_id:
                 try:
-                    hs_summary = fetch_hubstaff_for_advisor(run_date, advisor.hubstaff_id)
-                    hubstaff_payload = dict(summary_to_payload_dict(hs_summary))
+                    hs_summary_obj = fetch_hubstaff_for_advisor(run_date, advisor.hubstaff_id)
+                    hubstaff_payload = dict(summary_to_payload_dict(hs_summary_obj))
                     hubstaff_payload["available"] = True
                 except Exception as exc:
                     hubstaff_payload = {"available": False, "error": str(exc)[:400]}
@@ -260,6 +274,16 @@ def test_advisors_mapped_supabase_then_calls_and_meetings(workflow: ConceptWorkf
         training_payload = workflow.trainings_payload_for_mongo_user_id(uid)
         assert isinstance(training_payload, dict)
 
+        tier = _compute_performance_tier(calls_count, meetings_n)
+        objective_str = build_objective_of_the_day(
+            hs_summary_obj,
+            hubstaff_integration_active=hubstaff_configured(),
+            has_hubstaff_id=bool(advisor.hubstaff_id),
+            performance_tier=tier,
+            calls_yesterday=calls_count,
+            meetings_yesterday=meetings_n,
+        )
+
         daily_payload = workflow.build_daily_payload(
             advisor,
             run_date,
@@ -269,6 +293,7 @@ def test_advisors_mapped_supabase_then_calls_and_meetings(workflow: ConceptWorkf
             coaching_row,
             hubstaff_payload,
             training_payload,
+            objective_of_the_day=objective_str,
         )
         assert isinstance(daily_payload, dict)
         assert daily_payload.get("Calls yesterday") == calls_count
@@ -277,6 +302,7 @@ def test_advisors_mapped_supabase_then_calls_and_meetings(workflow: ConceptWorkf
         assert "Performance Tier" in daily_payload
         assert "Feedback Summary" in daily_payload
         assert "Memory" in daily_payload
+        assert daily_payload.get("Objective of the day") == objective_str
         assert daily_payload.get("Hubstaff") == hubstaff_payload
         assert daily_payload.get("trainings") == training_payload
 
@@ -291,8 +317,8 @@ def test_advisors_mapped_supabase_then_calls_and_meetings(workflow: ConceptWorkf
 
         if not _has_yesterday_activity(calls_count, meetings_n):
             _log_print(
-                "  note: production may skip VAPI call due to no yesterday activity "
-                f"(calls={calls_count}, meetings={meetings_n})"
+                "  note: sample filter — low yesterday CRM activity "
+                f"(calls={calls_count}, meetings={meetings_n}); production still dials all mapped advisors"
             )
 
         _log_print("")

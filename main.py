@@ -2,8 +2,11 @@
 
 Execution modes:
 - **Scheduler** (optional): `ENABLE_SCHEDULER=1` — daily job at `DAILY_CRON` in `SCHEDULER_TZ` (default 09:30 Europe/London)
-  runs **all concepts** for London yesterday; recall poll at `RECALL_POLL_CRON` or `RECALL_POLL_INTERVAL_SECONDS`.
-  Optional **one-shot** daily batch: `SCHEDULER_DAILY_FIRST_RUN_DELAY_SECONDS` (e.g. 120) schedules `_scheduled_daily` once after that many seconds.
+  runs **all concepts** for all mapped advisors (London previous working day for CRM/NAC/coaching + Hubstaff window).
+  Outbound dials from this job only occur **09:30–10:00 London** (`enforce_scheduled_morning_window`); HTTP/CLI runs are unrestricted.
+  **Recall redials** default to three clock triggers Mon–Fri at **09:40, 09:50, 10:00** London (`RECALL_USE_MORNING_SLOT_CRON=1`)
+  unless `RECALL_POLL_INTERVAL_SECONDS` or `RECALL_POLL_CRON` is set. Recall processing is limited to **09:30–10:59** London
+  when `RECALL_MORNING_WINDOW_ONLY=1` (default). Optional **one-shot** daily batch: `SCHEDULER_DAILY_FIRST_RUN_DELAY_SECONDS`.
   Tests: `SCHEDULER_SKIP_DAILY_CRON=1` registers only the delayed job (no repeating cron).
 - **POST /run-all**: same as scheduler batch — all concepts, all Mongo advisors matching each concept.
 - **POST /run/{concept}**: one concept, all matching Mongo advisors.
@@ -92,7 +95,12 @@ def _scheduled_daily() -> None:
     run_date = default_run_date()
     for cid in list_concept_ids():
         try:
-            _, metrics = process_concept(cid, run_date=run_date, enable_recall_tracking=True)
+            _, metrics = process_concept(
+                cid,
+                run_date=run_date,
+                enable_recall_tracking=True,
+                enforce_scheduled_morning_window=True,
+            )
             logger.info("Scheduled run complete %s: %s", cid, metrics)
         except Exception:  # noqa: BLE001
             logger.exception("Scheduled run failed for %s", cid)
@@ -166,8 +174,34 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                 )
 
         recall_interval_raw = (os.environ.get("RECALL_POLL_INTERVAL_SECONDS") or "").strip()
+        recall_morning_slots = os.environ.get("RECALL_USE_MORNING_SLOT_CRON", "1").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        )
         recall_parts: List[str] = []
-        if recall_interval_raw:
+        if recall_morning_slots and not recall_interval_raw:
+            # 09:40, 09:50, 10:00 London Mon–Fri — 10-minute ladder after 09:30 daily batch (initial dial wave).
+            for jid, minute, hour in (
+                ("recall_poll_0940", "40", "9"),
+                ("recall_poll_0950", "50", "9"),
+                ("recall_poll_1000", "0", "10"),
+            ):
+                _scheduler.add_job(
+                    _scheduled_recall_poll,
+                    CronTrigger(
+                        minute=minute,
+                        hour=hour,
+                        day="*",
+                        month="*",
+                        day_of_week="mon-fri",
+                        timezone=tz_name,
+                    ),
+                    id=jid,
+                    replace_existing=True,
+                )
+            recall_parts = ["morning_slots_London=09:40,09:50,10:00_mon-fri"]
+        elif recall_interval_raw:
             try:
                 recall_sec = max(5, int(recall_interval_raw))
             except ValueError:
