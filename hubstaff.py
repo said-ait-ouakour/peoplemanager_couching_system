@@ -255,7 +255,64 @@ def summary_to_payload_dict(s: HubstaffSummary) -> Dict[str, Any]:
         "late_start_after_9am_london": s.late_start_after_9am_london,
         "idle_start_time": s.idle_start_time,
         "idle_end_time": s.idle_end_time,
+        "activity_percentage": s.activity_percentage,
+        "tracked_hours": round(s.tracked_seconds / 3600.0, 2) if s.tracked_seconds else 0.0,
     }
+
+
+def build_objective_of_the_day(
+    summary: Optional[HubstaffSummary],
+    *,
+    hubstaff_integration_active: bool,
+    has_hubstaff_id: bool,
+    performance_tier: str,
+    calls_yesterday: int,
+    meetings_yesterday: int,
+) -> str:
+    """Short coaching objective for ``daily_payload['Objective of the day']`` (Hubstaff + CRM signals).
+
+    Does not modify VAPI assistant prompts — only adds structured context for the assistant.
+    """
+    parts: List[str] = []
+
+    if summary is not None:
+        if summary.late_start_after_9am_london:
+            parts.append(
+                "Start tracked Hubstaff work before 09:00 London today so the full day supports outreach targets."
+            )
+        if summary.idle_over_30:
+            parts.append(
+                "Cut extended idle stretches (latest gap over 30 minutes): shorten breaks and return to focused work faster."
+            )
+        if summary.low_activity:
+            parts.append(
+                f"Raise Hubstaff activity intensity above {LOW_ACTIVITY_PCT_THRESHOLD:.0f}% of tracked time while executing CRM dial and meeting targets."
+            )
+        if not parts:
+            parts.append(
+                "Keep strong Hubstaff discipline: sustain focused tracked blocks and translate them into CRM outcomes today."
+            )
+        parts.append(
+            f"Today's focus: tier {performance_tier} — build on yesterday's {calls_yesterday} calls and {meetings_yesterday} meetings with measurable Hubstaff-tracked effort toward quota."
+        )
+        return " ".join(parts)
+
+    if hubstaff_integration_active and has_hubstaff_id:
+        return (
+            "Hubstaff data was unavailable for yesterday — prioritize consistent tracked focus blocks today and align "
+            f"dials/meetings with tier {performance_tier} (yesterday: {calls_yesterday} calls, {meetings_yesterday} meetings)."
+        )
+
+    if hubstaff_integration_active and not has_hubstaff_id:
+        return (
+            "Link your Hubstaff user id so coaching can tie objectives to tracked work; today execute CRM targets with "
+            f"sustained logged activity (tier {performance_tier}; yesterday {calls_yesterday} calls, {meetings_yesterday} meetings)."
+        )
+
+    return (
+        f"Today's objective (tier {performance_tier}): grow measurable outreach — yesterday shows {calls_yesterday} calls "
+        f"and {meetings_yesterday} meetings; schedule focused execution blocks and hit today's CRM targets."
+    )
 
 
 @retry(

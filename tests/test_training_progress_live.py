@@ -181,6 +181,7 @@ def test_fetch_trainingprogresses_by_user_id_and_build_trainings_payload(
         None,
         None,
         sample_daily_payload_trainings,
+        objective_of_the_day="Training integration — objective stub.",
     )
     assert daily_payload.get("trainings") is sample_daily_payload_trainings
 

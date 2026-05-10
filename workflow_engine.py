@@ -12,7 +12,7 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
-from datetime import date, datetime
+from datetime import date, datetime, time as dt_time
 from zoneinfo import ZoneInfo
 
 import phonenumbers
@@ -27,6 +27,8 @@ from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_ex
 from concepts import ResolvedConcept, get_concept_definition
 from dates_london import london_today_date, yesterday_london_iso, yesterday_london_utc_bounds
 from hubstaff import (
+    HubstaffSummary,
+    build_objective_of_the_day,
     fetch_hubstaff_for_advisor,
     hubstaff_configured,
     summary_to_payload_dict,
@@ -74,6 +76,27 @@ def _recall_max_call_attempts() -> int:
 def _recall_poll_ignore_london_hours() -> bool:
     """If true, recall polls run outside Mon–Fri 09:00–17:00 London (for staging/integration tests)."""
     return os.environ.get("RECALL_POLL_IGNORE_LONDON_HOURS", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _recall_use_morning_window_only() -> bool:
+    """When true (default), recall redials only run 09:30–10:59 London Mon–Fri instead of full working day."""
+    return os.environ.get("RECALL_MORNING_WINDOW_ONLY", "1").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _is_morning_coaching_recall_window() -> bool:
+    """London weekday 09:30–10:00 inclusive (supports 10-minute retry ladder ending at 10:00)."""
+    now = datetime.now(LONDON)
+    if now.weekday() >= 5:
+        return False
+    t = now.time()
+    return dt_time(9, 30, 0) <= t <= dt_time(10, 0, 59)
+
+
+def _scheduled_morning_outbound_dial_allowed() -> bool:
+    """London clock 09:30:00–10:00:59 inclusive — outbound dials for APScheduler daily batch only (not manual/API)."""
+    now = datetime.now(LONDON)
+    t = now.time()
+    return dt_time(9, 30, 0) <= t <= dt_time(10, 0, 59)
 
 
 def _coerce_daily_payload_from_tracking(val: Any) -> Dict[str, Any]:
@@ -894,6 +917,7 @@ class ConceptWorkflow:
         last_coaching_row: Optional[Dict[str, Any]],
         hubstaff: Optional[Dict[str, Any]] = None,
         training: Optional[Dict[str, Any]] = None,
+        objective_of_the_day: str = "",
     ) -> Dict[str, Any]:
         """Structured fields for VAPI assistantOverrides.variableValues.daily_payload (display labels)."""
         c = self.concept
@@ -910,6 +934,7 @@ class ConceptWorkflow:
             "Performance Tier": tier,
             "Calls yesterday": calls_n,
             "Meetings yesterday": meetings_n,
+            "Objective of the day": objective_of_the_day,
             "Feedback Summary": feedback_summary,
             "Coaching Context": _coaching_context_label(c.concept_id),
             "Memory": memory,
@@ -1290,14 +1315,27 @@ class ConceptWorkflow:
             "skipped_max_attempts": 0,
             "failed": 0,
         }
-        if not _recall_poll_ignore_london_hours() and not self._is_london_working_hours():
-            stats["skipped_outside_hours"] += 1
-            logger.info("Recall poll skipped outside London working hours for concept=%s", self.concept.concept_id)
-            self._write_concept_log(
-                "recall",
-                "daily_coach_tracking recall poll skipped: outside London working hours",
-            )
-            return stats
+        if not _recall_poll_ignore_london_hours():
+            if _recall_use_morning_window_only():
+                if not _is_morning_coaching_recall_window():
+                    stats["skipped_outside_hours"] += 1
+                    logger.info(
+                        "Recall poll skipped outside morning coaching window (09:30–10:00 London) for concept=%s",
+                        self.concept.concept_id,
+                    )
+                    self._write_concept_log(
+                        "recall",
+                        "daily_coach_tracking recall poll skipped: outside morning coaching window",
+                    )
+                    return stats
+            elif not self._is_london_working_hours():
+                stats["skipped_outside_hours"] += 1
+                logger.info("Recall poll skipped outside London working hours for concept=%s", self.concept.concept_id)
+                self._write_concept_log(
+                    "recall",
+                    "daily_coach_tracking recall poll skipped: outside London working hours",
+                )
+                return stats
         rows = self.fetch_tracking_rows_for_today_recall()
         self._write_concept_log(
             "recall",
@@ -1397,8 +1435,9 @@ class ConceptWorkflow:
         run_date: str,
         batch_run_id: str,
         enable_recall_tracking: bool = False,
+        enforce_scheduled_morning_window: bool = False,
     ) -> str:
-        """Returns outcome: success | skipped | failed."""
+        """Returns outcome: success | skipped | skipped_morning_window | failed."""
         try:
             uid = self._advisor_supabase_user_id(advisor)
             if not uid:
@@ -1407,6 +1446,13 @@ class ConceptWorkflow:
                     advisor.email,
                 )
                 return "skipped"
+
+            if enforce_scheduled_morning_window and not _scheduled_morning_outbound_dial_allowed():
+                logger.info(
+                    "Skipping advisor %s: scheduled morning outbound window closed (London 09:30–10:00)",
+                    advisor.email,
+                )
+                return "skipped_morning_window"
 
             yesterday_calls = self.fetch_yesterday_customer_calls_from_mongo(uid, run_date)
             calls_count = len(yesterday_calls)
@@ -1428,35 +1474,27 @@ class ConceptWorkflow:
                 f"advisor={advisor.advisor_name} email={advisor.email} phone={advisor.e164_phone} calls={calls_count} meetings={meetings_count} run_date={run_date}",
             )
 
-            if calls_count == 0 and meetings_count == 0:
-                logger.info(
-                    "Skipping advisor %s: no calls or meetings yesterday (Mongo calls=%s Supabase meetings=%s)",
-                    advisor.email,
-                    calls_count,
-                    meetings_count,
-                )
-                return "skipped"
-
+            hs_summary: Optional[HubstaffSummary] = None
             hubstaff_payload: Optional[Dict[str, Any]] = None
             if hubstaff_configured():
                 if advisor.hubstaff_id:
                     try:
-                        summary = fetch_hubstaff_for_advisor(run_date, advisor.hubstaff_id)
-                        hubstaff_payload = dict(summary_to_payload_dict(summary))
+                        hs_summary = fetch_hubstaff_for_advisor(run_date, advisor.hubstaff_id)
+                        hubstaff_payload = dict(summary_to_payload_dict(hs_summary))
                         logger.info(
                             "[hubstaff] concept=%s advisor=%s idle_over_30=%s low_activity=%s late_9am=%s first=%s",
                             self.concept.concept_id,
                             advisor.email,
-                            summary.idle_over_30,
-                            summary.low_activity,
-                            summary.late_start_after_9am_london,
-                            summary.first_activity_time,
+                            hs_summary.idle_over_30,
+                            hs_summary.low_activity,
+                            hs_summary.late_start_after_9am_london,
+                            hs_summary.first_activity_time,
                         )
                         self._write_concept_log(
                             "hubstaff",
                             f"advisor={advisor.advisor_name} email={advisor.email} hubstaff_id={advisor.hubstaff_id} "
-                            f"idle_over_30={summary.idle_over_30} low_activity={summary.low_activity} "
-                            f"late_9am_london={summary.late_start_after_9am_london}",
+                            f"idle_over_30={hs_summary.idle_over_30} low_activity={hs_summary.low_activity} "
+                            f"late_9am_london={hs_summary.late_start_after_9am_london}",
                         )
                     except Exception as exc:
                         logger.warning("[hubstaff] fetch failed advisor=%s: %s", advisor.email, exc)
@@ -1465,6 +1503,16 @@ class ConceptWorkflow:
                     hubstaff_payload = {}
             else:
                 hubstaff_payload = {}
+
+            tier_for_objective = _compute_performance_tier(calls_count, meetings_count)
+            objective_text = build_objective_of_the_day(
+                hs_summary,
+                hubstaff_integration_active=hubstaff_configured(),
+                has_hubstaff_id=bool(advisor.hubstaff_id),
+                performance_tier=tier_for_objective,
+                calls_yesterday=calls_count,
+                meetings_yesterday=meetings_count,
+            )
 
             training_payload, prog_n = self._compute_trainings_payload(uid)
             if training_progress_enabled():
@@ -1486,6 +1534,7 @@ class ConceptWorkflow:
                 coaching,
                 hubstaff_payload,
                 training_payload,
+                objective_of_the_day=objective_text,
             )
             logger.info(
                 "Daily payload prepared [%s] name=%s email=%s payload=%s",
@@ -1498,6 +1547,12 @@ class ConceptWorkflow:
                 "vapi",
                 f"prepared advisor={advisor.advisor_name} email={advisor.email} phone={advisor.e164_phone} payload={daily_payload}",
             )
+            if enforce_scheduled_morning_window and not _scheduled_morning_outbound_dial_allowed():
+                logger.info(
+                    "Skipping VAPI dial for %s: outside scheduled morning window after payload prep",
+                    advisor.email,
+                )
+                return "skipped_morning_window"
             _status, _text, vapi_id = self.call_vapi_advisor(advisor, daily_payload)
             self._save_initial_tracking_row(advisor, daily_payload, vapi_id, enable_recall_tracking)
             logger.info(
@@ -1526,9 +1581,22 @@ class ConceptWorkflow:
         mongo_user_ids: Optional[List[str]] = None,
         enable_recall_tracking: bool = False,
         metrics_cb: Optional[Callable[[str], None]] = None,
+        enforce_scheduled_morning_window: bool = False,
     ) -> Dict[str, int]:
-        counts = {"processed": 0, "success": 0, "skipped": 0, "failed": 0}
+        counts = {"processed": 0, "success": 0, "skipped": 0, "failed": 0, "skipped_morning_window": 0}
         self._active_run_date = run_date
+
+        if enforce_scheduled_morning_window and not _scheduled_morning_outbound_dial_allowed():
+            logger.warning(
+                "[%s] Scheduled morning batch aborted: not within London outbound window 09:30–10:00 (cron misfire or manual clock)",
+                self.concept.concept_id,
+            )
+            self._write_concept_log(
+                "schedule",
+                "scheduled_batch_skipped: outside 09:30-10:00 London window",
+            )
+            self._active_run_date = None
+            return counts
 
         advisors = self.get_advisors_from_mongo(mongo_user_ids)
         logger.info("[%s] Mongo advisors found: %d", self.concept.concept_id, len(advisors))
@@ -1549,6 +1617,7 @@ class ConceptWorkflow:
                 run_date,
                 batch_run_id,
                 enable_recall_tracking=enable_recall_tracking,
+                enforce_scheduled_morning_window=enforce_scheduled_morning_window,
             )
 
         def _record(out: str) -> None:
@@ -1578,8 +1647,13 @@ def process_concept(
     mongo_user_ids: Optional[List[str]] = None,
     enable_recall_tracking: bool = False,
     metrics_cb: Optional[Callable[[str], None]] = None,
+    enforce_scheduled_morning_window: bool = False,
 ) -> Tuple[str, Dict[str, int]]:
-    """Run pipeline for one concept. Optional `mongo_user_ids` restricts Mongo users._id (hex strings)."""
+    """Run pipeline for one concept. Optional `mongo_user_ids` restricts Mongo users._id (hex strings).
+
+    When ``enforce_scheduled_morning_window`` is True (APScheduler daily job only), outbound VAPI dials are only
+    placed between 09:30 and 10:00 Europe/London. Manual/API/CLI runs omit this flag.
+    """
     rid = batch_run_id or str(uuid.uuid4())
     date_s = run_date or default_run_date()
     concept = resolve_concept_from_env(concept_id)
@@ -1592,6 +1666,7 @@ def process_concept(
             mongo_user_ids=mongo_user_ids,
             enable_recall_tracking=enable_recall_tracking,
             metrics_cb=metrics_cb,
+            enforce_scheduled_morning_window=enforce_scheduled_morning_window,
         )
         return rid, metrics
     finally:
