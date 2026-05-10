@@ -33,6 +33,7 @@ import pytest
 
 from concepts import list_concept_ids
 from dates_london import yesterday_london_iso
+from hubstaff import fetch_hubstaff_for_advisor, hubstaff_configured, summary_to_payload_dict
 from workflow_engine import ConceptWorkflow, SharedServiceConfig, resolve_concept_from_env
 
 
@@ -126,7 +127,7 @@ def pytest_generate_tests(metafunc: Any) -> None:
 
 @pytest.mark.skipif(not _enabled(), reason="Set RUN_DATA_INTEGRATION_TESTS=1 to run live Mongo/Supabase fetch tests.")
 def test_advisors_mapped_supabase_then_calls_and_meetings(workflow: ConceptWorkflow, concept_id: str) -> None:
-    """Mongo advisors → Supabase map → calls/meetings/NAC/coaching → daily_payload when yesterday has activity."""
+    """Mongo/Supabase reads + live Hubstaff/trainings blocks → daily_payload core fields."""
     run_date = _run_date()
     cap = _max_advisors()
     calls_date_col = workflow.concept.calls_date_col
@@ -136,6 +137,7 @@ def test_advisors_mapped_supabase_then_calls_and_meetings(workflow: ConceptWorkf
 
     mongo_advisors = workflow.get_advisors_from_mongo()
     assert isinstance(mongo_advisors, list)
+    workflow.prefetch_training_reference_maps()
 
     mapped = workflow.map_advisors_to_supabase_phone(mongo_advisors)
     assert isinstance(mapped, list)
@@ -240,28 +242,57 @@ def test_advisors_mapped_supabase_then_calls_and_meetings(workflow: ConceptWorkf
                 _log_print(f"    {json.dumps(brief_co, default=str)}")
 
         calls_count = len(yesterday_calls)
-        if _has_yesterday_activity(calls_count, meetings_n):
-            daily_payload = workflow.build_daily_payload(
-                advisor,
-                run_date,
-                calls_count,
-                meetings_n,
-                nac_row,
-                coaching_row,
-            )
-            assert isinstance(daily_payload, dict)
-            assert daily_payload.get("Calls yesterday") == calls_count
-            assert daily_payload.get("Meetings yesterday") == meetings_n
-            assert daily_payload.get("Advisor Name") == advisor.advisor_name
-            _log_print("  daily_payload (build_daily_payload — would send to VAPI variableValues):")
-            try:
-                _log_print(json.dumps(daily_payload, default=str, indent=2))
-            except Exception:
-                _log_print(f"    {daily_payload!r}")
+
+        hubstaff_payload: Dict[str, Any]
+        if hubstaff_configured():
+            if advisor.hubstaff_id:
+                try:
+                    hs_summary = fetch_hubstaff_for_advisor(run_date, advisor.hubstaff_id)
+                    hubstaff_payload = dict(summary_to_payload_dict(hs_summary))
+                    hubstaff_payload["available"] = True
+                except Exception as exc:
+                    hubstaff_payload = {"available": False, "error": str(exc)[:400]}
+            else:
+                hubstaff_payload = {"available": False, "reason": "missing_hubstaff_id"}
         else:
+            hubstaff_payload = {"available": False, "reason": "hubstaff_not_configured"}
+
+        training_payload = workflow.trainings_payload_for_mongo_user_id(uid)
+        assert isinstance(training_payload, dict)
+
+        daily_payload = workflow.build_daily_payload(
+            advisor,
+            run_date,
+            calls_count,
+            meetings_n,
+            nac_row,
+            coaching_row,
+            hubstaff_payload,
+            training_payload,
+        )
+        assert isinstance(daily_payload, dict)
+        assert daily_payload.get("Calls yesterday") == calls_count
+        assert daily_payload.get("Meetings yesterday") == meetings_n
+        assert daily_payload.get("Advisor Name") == advisor.advisor_name
+        assert "Performance Tier" in daily_payload
+        assert "Feedback Summary" in daily_payload
+        assert "Memory" in daily_payload
+        assert daily_payload.get("Hubstaff") == hubstaff_payload
+        assert daily_payload.get("trainings") == training_payload
+
+        _log_print("  hubstaff (live):")
+        _log_print(f"    {json.dumps(hubstaff_payload, default=str)}")
+        _log_print(f"  trainings (live): workspaces={len(training_payload)}")
+        _log_print("  daily_payload (build_daily_payload — would send to VAPI variableValues):")
+        try:
+            _log_print(json.dumps(daily_payload, default=str, indent=2))
+        except Exception:
+            _log_print(f"    {daily_payload!r}")
+
+        if not _has_yesterday_activity(calls_count, meetings_n):
             _log_print(
-                "  daily_payload: skipped (no yesterday activity per DATA_FETCH_TEST_DAILY_PAYLOAD_ACTIVITY; "
-                f"calls={calls_count}, meetings={meetings_n})"
+                "  note: production may skip VAPI call due to no yesterday activity "
+                f"(calls={calls_count}, meetings={meetings_n})"
             )
 
         _log_print("")
