@@ -26,6 +26,13 @@ _SHARED_SUPABASE_USER_ROLE = {
     "supabase_user_role_value": "advisor",
 }
 
+_EXCLUDED_DAILY_COACH_ADVISOR_QUERY = {
+    "$and": [
+        {"$expr": {"$ne": [{"$toString": "$_id"}, "67b2f8a63782cb04fa0e3e31"]}},
+        {"email": {"$ne": "aitouakoursaid@gmail.com"}},
+    ],
+}
+
 # Supabase meetings (per concept project): count rows for meetings_yesterday.
 _SHARED_MEETINGS = {
     "supabase_advisor_id_col": "id",
@@ -43,7 +50,7 @@ CONCEPTS: Dict[str, Dict[str, Any]] = {
         **_SHARED_SUPABASE_USER_ROLE,
         **_SHARED_MEETINGS,
         "mongo_users_collection": "users",
-        "advisor_query": {"role": "advisor"},
+        "advisor_query": {"role": "advisor", **_EXCLUDED_DAILY_COACH_ADVISOR_QUERY},
         # Phone: Supabase users.peoplemanager_id = str(Mongo users._id)
         "supabase_lookup_mode": "peoplemanager_id",
         "supabase_user_table": "users",
@@ -60,7 +67,7 @@ CONCEPTS: Dict[str, Dict[str, Any]] = {
         **_SHARED_SUPABASE_USER_ROLE,
         **_SHARED_MEETINGS,
         "mongo_users_collection": "users",
-        "advisor_query": {"role": "advisor"},
+        "advisor_query": {"role": "advisor", **_EXCLUDED_DAILY_COACH_ADVISOR_QUERY},
         # Phone: Supabase users row matched by email
         "supabase_lookup_mode": "email",
         "supabase_user_table": "users",

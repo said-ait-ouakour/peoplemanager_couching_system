@@ -1,9 +1,9 @@
 """FastAPI orchestration service: multi-tenant concepts.
 
 Execution modes:
-- **Scheduler** (optional): `ENABLE_SCHEDULER=1` — daily job at `DAILY_CRON` in `SCHEDULER_TZ` (default 09:30 Europe/London)
+- **Scheduler** (optional): `ENABLE_SCHEDULER=1` — daily job at `DAILY_CRON` in `SCHEDULER_TZ` (default 09:30 Europe/London, Monday-Friday)
   runs **all concepts** for all mapped advisors (London previous working day for CRM/NAC/coaching + Hubstaff window).
-  Outbound dials from this job only occur **09:30–10:00 London** (`enforce_scheduled_morning_window`); HTTP/CLI runs are unrestricted.
+  Outbound dials from this job only occur **Monday-Friday, 09:30–10:00 London** (`enforce_scheduled_morning_window`); HTTP/CLI runs are unrestricted.
   **Recall redials** default to three clock triggers Mon–Fri at **09:40, 09:50, 10:00** London (`RECALL_USE_MORNING_SLOT_CRON=1`)
   unless `RECALL_POLL_INTERVAL_SECONDS` or `RECALL_POLL_CRON` is set. Recall processing is limited to **09:30–10:59** London
   when `RECALL_MORNING_WINDOW_ONLY=1` (default). Optional **one-shot** daily batch: `SCHEDULER_DAILY_FIRST_RUN_DELAY_SECONDS`.
@@ -91,7 +91,22 @@ def _finish_run(run_id: str, results: Dict[str, Any], error: Optional[str] = Non
         _RUNS[run_id]["error"] = error
 
 
+def _scheduled_daily_allowed(now: Optional[datetime] = None) -> bool:
+    tz_name = os.environ.get("SCHEDULER_TZ", "Europe/London")
+    tzinfo = ZoneInfo(tz_name)
+    current = now or datetime.now(tzinfo)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=tzinfo)
+    else:
+        current = current.astimezone(tzinfo)
+    return current.weekday() < 5
+
+
 def _scheduled_daily() -> None:
+    if not _scheduled_daily_allowed():
+        logger.warning("Scheduled daily skipped: weekend in %s", os.environ.get("SCHEDULER_TZ", "Europe/London"))
+        return
+
     run_date = default_run_date()
     for cid in list_concept_ids():
         try:
@@ -127,7 +142,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         tz_name = os.environ.get("SCHEDULER_TZ", "Europe/London")
         tzinfo = ZoneInfo(tz_name)
         skip_daily_cron = os.environ.get("SCHEDULER_SKIP_DAILY_CRON", "").strip().lower() in ("1", "true", "yes")
-        cron = os.environ.get("DAILY_CRON", "30 9 * * *")
+        cron = os.environ.get("DAILY_CRON", "30 9 * * mon-fri")
         parts = cron.split()
 
         _scheduler = BackgroundScheduler(
