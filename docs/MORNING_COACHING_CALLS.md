@@ -9,7 +9,7 @@ For general usage (CLI, HTTP routes, tests), see [`USAGE_AND_TESTS.md`](USAGE_AN
 ## 1. Goals
 
 - **Reach every mapped advisor** in the morning batch: there is **no** requirement for prior CRM activity (calls/meetings “yesterday”). Anyone who passes Mongo + Supabase phone mapping can receive an outbound coaching dial.
-- **Scheduled automation only**: the **first outbound wave** from the **APScheduler daily job** places VAPI calls only when the wall clock in **Europe/London** is between **09:30:00** and **10:00:59** (inclusive).
+- **Scheduled automation only**: the **first outbound wave** from the **APScheduler daily job** places VAPI calls only on **Monday-Friday** when the wall clock in **Europe/London** is between **09:30:00** and **10:00:59** (inclusive).
 - **Operators and integrations** using HTTP or CLI are **not** bound to that window unless they choose to run inside it manually.
 
 ---
@@ -18,7 +18,7 @@ For general usage (CLI, HTTP routes, tests), see [`USAGE_AND_TESTS.md`](USAGE_AN
 
 | Path | How it is triggered | Morning 09:30–10:00 London outbound rule |
 |------|---------------------|------------------------------------------|
-| **Scheduled daily batch** | `ENABLE_SCHEDULER=1`, job id `daily_all_concepts`, cron `DAILY_CRON` (default `30 9 * * *`), timezone `SCHEDULER_TZ` (default `Europe/London`) | **Yes.** `process_concept(..., enforce_scheduled_morning_window=True)` |
+| **Scheduled daily batch** | `ENABLE_SCHEDULER=1`, job id `daily_all_concepts`, cron `DAILY_CRON` (default `30 9 * * mon-fri`), timezone `SCHEDULER_TZ` (default `Europe/London`) | **Yes.** `_scheduled_daily()` blocks weekends before `process_concept(..., enforce_scheduled_morning_window=True)` |
 | **HTTP** `POST /run-all`, `/run/{concept}`, `/run/{concept}/advisors` | Manual or external caller | **No** enforcement flag |
 | **CLI** `python -m advisor_daily_workflow` | Operator | **No** enforcement flag |
 
@@ -28,15 +28,15 @@ Implementation detail: only `_scheduled_daily()` in `main.py` passes `enforce_sc
 
 ## 3. Clock rules for the scheduled morning batch
 
-Function: `_scheduled_morning_outbound_dial_allowed()` in `workflow_engine.py`.
+Functions: `_scheduled_daily_allowed()` in `main.py` and `_scheduled_morning_outbound_dial_allowed()` in `workflow_engine.py`.
 
 - **Timezone:** `Europe/London` (local time, including BST/GMT as applicable).
-- **Allowed outbound dial window:** from **09:30:00** through **10:00:59** on the London clock.
-- **Weekends:** there is **no** Saturday/Sunday filter on this window for the **initial outbound** batch (if your `DAILY_CRON` runs on a weekend, the same time band applies).
+- **Allowed outbound dial window:** Monday-Friday from **09:30:00** through **10:00:59** on the London clock.
+- **Weekends:** scheduled initial outbound batches are blocked on Saturday/Sunday before advisor processing starts.
 
 ### 3.1 When the batch starts outside the window
 
-If the daily job fires **before** 09:30 or **after** 10:00:59 (misfire, clock skew, delay), `ConceptWorkflow.run()` **aborts that concept’s run** immediately: no advisor processing for that concept in that invocation.
+If the daily job fires on a **weekend**, `_scheduled_daily()` returns before processing any concept. If it fires **before** 09:30 or **after** 10:00:59 (misfire, clock skew, delay), `ConceptWorkflow.run()` **aborts that concept’s run** immediately: no advisor processing for that concept in that invocation.
 
 ### 3.2 When the batch starts inside the window but runs past 10:00
 
@@ -88,21 +88,25 @@ sequenceDiagram
     participant VAPI as VAPI outbound
 
     Cron->>Main: 09:30 London (default)
-    loop Each concept
-        Main->>PC: enforce_scheduled_morning_window=True
-        PC->>WF: run(...)
-        alt Outside 09:30–10:00:59 London at start
-            WF-->>Main: abort concept (no dials)
-        else Inside window
-            WF->>WF: load advisors, map Supabase phones
-            loop Each advisor (pool)
-                WF->>PA: process_single_advisor
-                alt Outside window before prep
-                    PA-->>WF: skipped_morning_window
-                else Payload built; still inside window
-                    PA->>VAPI: POST /call
-                else Outside window before dial
-                    PA-->>WF: skipped_morning_window
+    alt Weekend in scheduler timezone
+        Main-->>Cron: skip, no concept processing
+    else Weekday
+        loop Each concept
+            Main->>PC: enforce_scheduled_morning_window=True
+            PC->>WF: run(...)
+            alt Outside 09:30–10:00:59 London at start
+                WF-->>Main: abort concept (no dials)
+            else Inside window
+                WF->>WF: load advisors, map Supabase phones
+                loop Each advisor (pool)
+                    WF->>PA: process_single_advisor
+                    alt Outside window before prep
+                        PA-->>WF: skipped_morning_window
+                    else Payload built; still inside window
+                        PA->>VAPI: POST /call
+                    else Outside window before dial
+                        PA-->>WF: skipped_morning_window
+                    end
                 end
             end
         end
@@ -143,7 +147,7 @@ Typical keys returned from `process_concept` / `ConceptWorkflow.run`:
 |----------|------|
 | `ENABLE_SCHEDULER` | Turn on APScheduler in `main.py` |
 | `SCHEDULER_TZ` | Default `Europe/London` |
-| `DAILY_CRON` | Default `30 9 * * *` (09:30) |
+| `DAILY_CRON` | Default `30 9 * * mon-fri` (09:30 Monday-Friday) |
 | `RECALL_USE_MORNING_SLOT_CRON` | Default on: 09:40, 09:50, 10:00 Mon–Fri recall triggers |
 | `RECALL_POLL_INTERVAL_SECONDS` | If set, overrides morning slot cron (interval recall) |
 | `RECALL_POLL_CRON` | Fallback cron when interval unset and morning slots off |
@@ -161,6 +165,7 @@ See `.env.example` for full templates.
 | Area | Location |
 |------|----------|
 | Scheduled daily + recall job registration | `main.py` (`lifespan`, `_scheduled_daily`, `_scheduled_recall_poll`) |
+| Scheduled weekend gate | `main.py` — `_scheduled_daily_allowed`, `_scheduled_daily` |
 | Morning outbound window (scheduled only) | `workflow_engine.py` — `_scheduled_morning_outbound_dial_allowed`, `run()`, `process_single_advisor()`, `process_concept(..., enforce_scheduled_morning_window=...)` |
 | Recall morning gate (weekday + time) | `workflow_engine.py` — `_is_morning_coaching_recall_window`, `process_recalls_for_today` |
 | Objective of the day | `hubstaff.build_objective_of_the_day`, merged in `build_daily_payload` |
