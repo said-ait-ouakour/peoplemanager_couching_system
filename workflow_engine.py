@@ -422,8 +422,7 @@ def resolve_concept_from_env(concept_id: str) -> ResolvedConcept:
         supabase_user_table=raw["supabase_user_table"],
         supabase_email_col=raw["supabase_email_col"],
         supabase_phone_col=raw["supabase_phone_col"],
-        supabase_user_role_col=raw["supabase_user_role_col"],
-        supabase_user_role_value=raw["supabase_user_role_value"],
+        supabase_user_active_col=raw["supabase_user_active_col"],
         supabase_peoplemanager_id_col=raw["supabase_peoplemanager_id_col"],
         calls_user_id_col=raw["calls_user_id_col"],
         calls_date_col=raw["calls_date_col"],
@@ -577,13 +576,16 @@ class ConceptWorkflow:
         Fetch one advisor row from Supabase `users` using concept lookup mode.
 
         Query is always an AND operation:
-          - role column must match configured advisor role
+          - no role filter (the adviser list is already restricted to active advisers in Mongo)
+          - user must be active (``supabase_user_active_col`` is true)
           - lookup key matches either email (TB) or peoplemanager_id (PM)
         """
         c = self.concept
         cols = f"{c.supabase_email_col},{c.supabase_phone_col},{c.supabase_advisor_id_col},hubstaff_id"
-        q = self.supabase.table(c.supabase_user_table).select(cols).eq(
-            c.supabase_user_role_col, c.supabase_user_role_value
+        q = (
+            self.supabase.table(c.supabase_user_table)
+            .select(cols)
+            .eq(c.supabase_user_active_col, True)
         )
         mode = (c.supabase_lookup_mode or "").strip().lower()
         if mode == "email":

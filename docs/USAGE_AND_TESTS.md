@@ -110,8 +110,7 @@ batch_id, metrics = process_concept(
 
 **`map_advisors_to_supabase_phone`** — For each Mongo advisor:
 
-- **`people_manager`:** Supabase `users` row where `peoplemanager_id` = `str(Mongo users._id)`.
-- **`t_and_b`:** Supabase `users` row matched by **email**.
+- **`people_manager`** and **`t_and_b`:** Supabase `users` row matched by **email** (lower-cased Mongo email), in each concept's own project. The row must be active (`is_active`); there is no role filter.
 
 Requires valid **phone** and Supabase **`id`** (used as `supabase_advisor_id`). **`hubstaff_id`** is read when present (numeric Hubstaff user id). Advisors without a match or valid E.164 phone are skipped (not counted as VAPI failures).
 

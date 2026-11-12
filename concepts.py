@@ -20,16 +20,17 @@ _SHARED_MONGO = {
     "coaching_order_col": "date",
 }
 
-# Supabase `users`: only rows with this role are treated as advisors when resolving phone/id.
-_SHARED_SUPABASE_USER_ROLE = {
-    "supabase_user_role_col": "role",
-    "supabase_user_role_value": "advisor",
+# Supabase `users` (T&B and PM): no role filter. The adviser list comes from Mongo (`advisor_query`);
+# the matching Supabase row only has to be active (and have a phone, checked at mapping time).
+_SHARED_SUPABASE_USER_FILTER = {
+    "supabase_user_active_col": "is_active",
 }
 
 _EXCLUDED_DAILY_COACH_ADVISOR_QUERY = {
     "$and": [
         {"$expr": {"$ne": [{"$toString": "$_id"}, "67b2f8a63782cb04fa0e3e31"]}},
         {"email": {"$ne": "aitouakoursaid@gmail.com"}},
+        {"$expr": {"$ne": [{"$toString": "$_id"}, "68ff9661eaeb31f2eeac69fc"]}},  # khadija chahidi
     ],
 }
 
@@ -47,12 +48,12 @@ _SHARED_MEETINGS = {
 CONCEPTS: Dict[str, Dict[str, Any]] = {
     "people_manager": {
         **_SHARED_MONGO,
-        **_SHARED_SUPABASE_USER_ROLE,
+        **_SHARED_SUPABASE_USER_FILTER,
         **_SHARED_MEETINGS,
         "mongo_users_collection": "users",
-        "advisor_query": {"role": "advisor", **_EXCLUDED_DAILY_COACH_ADVISOR_QUERY},
-        # Phone: Supabase users.peoplemanager_id = str(Mongo users._id)
-        "supabase_lookup_mode": "peoplemanager_id",
+        "advisor_query": {"role": "advisor", "isActive": True, **_EXCLUDED_DAILY_COACH_ADVISOR_QUERY},
+        # Phone: Supabase users row matched by email (same as t_and_b)
+        "supabase_lookup_mode": "email",
         "supabase_user_table": "users",
         "supabase_email_col": "email",
         "supabase_phone_col": "phone_number",
@@ -64,10 +65,10 @@ CONCEPTS: Dict[str, Dict[str, Any]] = {
     },
     "t_and_b": {
         **_SHARED_MONGO,
-        **_SHARED_SUPABASE_USER_ROLE,
+        **_SHARED_SUPABASE_USER_FILTER,
         **_SHARED_MEETINGS,
         "mongo_users_collection": "users",
-        "advisor_query": {"role": "advisor", **_EXCLUDED_DAILY_COACH_ADVISOR_QUERY},
+        "advisor_query": {"role": "advisor", "isActive": True, **_EXCLUDED_DAILY_COACH_ADVISOR_QUERY},
         # Phone: Supabase users row matched by email
         "supabase_lookup_mode": "email",
         "supabase_user_table": "users",
@@ -95,8 +96,7 @@ class ResolvedConcept:
     supabase_user_table: str
     supabase_email_col: str
     supabase_phone_col: str
-    supabase_user_role_col: str
-    supabase_user_role_value: str
+    supabase_user_active_col: str
     supabase_peoplemanager_id_col: str
     calls_user_id_col: str
     calls_date_col: str
