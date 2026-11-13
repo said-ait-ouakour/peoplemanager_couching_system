@@ -17,5 +17,7 @@ def test_daily_coach_advisor_queries_exclude_said_user():
         query = get_concept_definition(concept_id)["advisor_query"]
 
         assert query["role"] == "advisor"
+        assert query["isActive"] is True
         assert {"email": {"$ne": "aitouakoursaid@gmail.com"}} in query["$and"]
         assert {"$expr": {"$ne": [{"$toString": "$_id"}, "67b2f8a63782cb04fa0e3e31"]}} in query["$and"]
+        assert {"$expr": {"$ne": [{"$toString": "$_id"}, "68ff9661eaeb31f2eeac69fc"]}} in query["$and"]
