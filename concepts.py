@@ -1,7 +1,7 @@
 """Multi-tenant concept definitions: shared Mongo DB; per-concept Supabase phone rules + VAPI only."""
 
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 # Shared Mongo collections (same DB for all concepts; link userId = str(Mongo users._id))
 _SHARED_MONGO = {
@@ -20,9 +20,11 @@ _SHARED_MONGO = {
     "coaching_order_col": "date",
 }
 
-# Supabase `users` (T&B and PM): no role filter. The adviser list comes from Mongo (`advisor_query`);
-# the matching Supabase row only has to be active (and have a phone, checked at mapping time).
+# Supabase `users` (T&B and PM): the adviser list comes from Mongo (`advisor_query`); the matching
+# Supabase row must be active, have an allowed role (set per concept below, so PAs and VAs, which are
+# `manager` in the CRM, are never dialled) and have a phone (checked at mapping time).
 _SHARED_SUPABASE_USER_FILTER = {
+    "supabase_user_role_col": "role",
     "supabase_user_active_col": "is_active",
 }
 
@@ -52,6 +54,8 @@ CONCEPTS: Dict[str, Dict[str, Any]] = {
         **_SHARED_MEETINGS,
         "mongo_users_collection": "users",
         "advisor_query": {"role": "advisor", "isActive": True, **_EXCLUDED_DAILY_COACH_ADVISOR_QUERY},
+        # PM project role enum: advisor | manager | recruiter (no estate_planner value; filtering on it errors).
+        "supabase_user_role_values": ("advisor",),
         # Phone: Supabase users row matched by email (same as t_and_b)
         "supabase_lookup_mode": "email",
         "supabase_user_table": "users",
@@ -69,6 +73,8 @@ CONCEPTS: Dict[str, Dict[str, Any]] = {
         **_SHARED_MEETINGS,
         "mongo_users_collection": "users",
         "advisor_query": {"role": "advisor", "isActive": True, **_EXCLUDED_DAILY_COACH_ADVISOR_QUERY},
+        # T&B CRM: financial advisers (advisor) and estate planners only; PAs/VAs are `manager`.
+        "supabase_user_role_values": ("advisor", "estate_planner"),
         # Phone: Supabase users row matched by email
         "supabase_lookup_mode": "email",
         "supabase_user_table": "users",
@@ -96,6 +102,8 @@ class ResolvedConcept:
     supabase_user_table: str
     supabase_email_col: str
     supabase_phone_col: str
+    supabase_user_role_col: str
+    supabase_user_role_values: Tuple[str, ...]
     supabase_user_active_col: str
     supabase_peoplemanager_id_col: str
     calls_user_id_col: str
